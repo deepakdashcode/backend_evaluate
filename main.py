@@ -1,12 +1,12 @@
+from send_email.send_markdown import send_email_to_user
 import datetime
 from typing import List, Optional
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPBasic, OAuth2PasswordBearer, OAuth2PasswordRequestForm
-import httpx
 import jwt
 from sqlalchemy import select
-from sqlmodel import Session, create_engine, SQLModel
-from models.user import  Attempted, Token, TokenData, User, Quiz, Created, Answers
+from sqlmodel import Session, and_, create_engine, SQLModel
+from models.user import  Attempted, Token, TokenData, User, Quiz, Created, Answers, UserResponse
 from db.database import SessionDep, DATABASE_URL, engine
 from passlib.context import CryptContext
 from fastapi.testclient import TestClient
@@ -16,6 +16,9 @@ from datetime import datetime, timedelta, timezone
 from jwt import ExpiredSignatureError, InvalidTokenError, PyJWTError
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
+from google_utils.evaluate_gemini import evaluate_quiz
+import json
+
 
 load_dotenv()
 
@@ -32,7 +35,7 @@ oauth_2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],  # Allow all HTTP methods
     allow_headers=["*"],  # Allow all headers
@@ -54,10 +57,18 @@ def get_password_hash(password: str):
 
 def get_user(db, email: str):
     user = db.query(User).filter(User.email == email).first()
+    print("GETTING USER ", user)
     if user:
         return user
     
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Not found')
+
+# def get_user(db, id: str):
+#     user = db.query(User).filter(User.id == id).first()
+#     if user:
+#         return user
+    
+#     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Not found')
 
 
 
@@ -100,9 +111,13 @@ async def get_current_user(db: SessionDep,token: str = Depends(oauth_2_scheme)):
         raise credential_exception
     
     print('TOKEN DATA = ', token_data)
-    user = get_user(db, email=token_data.email)
+    # user = get_user(db, email=token_data.email)
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    print("IDJFI USER IS KDJKDK", user)
     if user is None:
         raise credential_exception
+    
+    print('HERE')
     
     return user
 
@@ -119,7 +134,7 @@ async def login_for_access_token(db: SessionDep,form_data: OAuth2PasswordRequest
     access_token = create_access_token(data={'sub': user.email}, expires_delta=access_token_expires)
     return {'access_token': access_token, 'token_type': "bearer"}
 
-@app.get('/users/me/', response_model=User)
+@app.get('/users/me/', response_model=UserResponse)
 async def read_users_me(current_user: User = Depends(get_current_active_user)):
     return current_user
 
@@ -152,7 +167,7 @@ def login(session: SessionDep, form_data: OAuth2PasswordRequestForm = Depends())
     # Create JWT token for authenticated user
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": str(user._mapping['User'].__dict__['id'])},
+        data={"sub": str(user._mapping['User'].__dict__['email'])},
         expires_delta=access_token_expires
     )
     
@@ -208,10 +223,11 @@ def read_root():
     return {"message": "Welcome to Quiz App"}
 
 
-@app.post('/user/add')
+@app.post('/user/add', response_model=UserResponse)
 async def create_user(username: str, email: str, password: str, session: SessionDep):
     
-    is_present = session.exec(select(User).where(User.email == email))
+    is_present = session.exec(select(User).where(User.email == email)).one_or_none()
+    print('IS PRESENT', is_present)
     if is_present:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='User already exists')
     hashed_password = pwd_context.hash(password)
@@ -223,6 +239,59 @@ async def create_user(username: str, email: str, password: str, session: Session
 
 
 # Function to create a quiz and associate it with a teacher user
+@app.get('/quiz/ids')
+async def get_ids(session: SessionDep, current_user: User = Depends(get_current_active_user)):
+    '''
+    Returns the ids that the current user can evaluate
+    '''
+    
+    
+    all_ids = session.exec(select(Created).where(Created.user_id == current_user.id)).all()
+    quiz_ids = [result[0].quiz_id for result in all_ids]
+    print(quiz_ids)
+    return quiz_ids
+
+
+def format_question(user_response):
+    user_id = list(user_response.keys())[0]
+    response = user_response[user_id]
+    questions = response['Questions']
+    answers = response['Answers']
+    if (len(questions) != len(answers)):
+        raise Exception(f'Length of question and aswer are not same for user {user_id}')
+    
+    
+    formatted_string = ''
+    for i in range(len(questions)):
+        formatted_string += questions[i] + '\n'
+        formatted_string += answers[i] + '\n\n'
+    
+    return formatted_string
+
+@app.get('/quiz/evaluate/{id}')
+async def evaluate(id: int, session: SessionDep, current_user: User = Depends(get_current_active_user)):
+    # Checking if the current user has permission to evaluate the quiz
+    created_by = session.exec(select(Created).where(and_(Created.user_id == current_user.id, Created.quiz_id == id))).one_or_none()
+    if not created_by:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='You are unauthorised for this quiz')
+    
+    
+    # AT this point we are sure that the user is authorised to evaulate the quiz
+    
+    # Fetching the users who have attempted the quiz
+    attempted_users = session.exec(select(Attempted).where(Attempted.quiz_id == id)).all()
+    all_user_ids = [result[0].user_id for result in attempted_users]
+    
+    results = {}
+    for user_id in all_user_ids:
+        response = await get_quiz_answers(id, user_id, session)
+        print(response)
+        results[user_id] = (evaluate_quiz(format_question(response)))
+        cur_user = session.exec(select(User).where(User.id == user_id)).one_or_none()
+        user_email = cur_user._mapping['User'].__dict__['email']
+        print('Email is ', user_email)
+        send_email_to_user(user_email, results[user_id])
+    return results
 
 @app.get('/quiz/{id}')
 def get_quiz(id: int, session: SessionDep):
@@ -259,6 +328,11 @@ async def create_quiz(
 
 @app.post("/quiz/attempt")
 async def attempt_quiz(quiz_id: int, answers: List[str], session: SessionDep, current_user: User = Depends(get_current_active_user)):
+    print("CURRENT USER IS (FROM QUIZ/ATTEMPT) ", current_user)
+    
+    current_answers = session.exec(select(Attempted).where(and_(Attempted.quiz_id == quiz_id, Attempted.user_id == current_user.id))).one_or_none()
+    if current_answers:
+        raise HTTPException(status_code=status.HTTP_208_ALREADY_REPORTED, detail='User has already attempted quiz')
     answer_data = Answers(user_id=current_user.id, quiz_id=quiz_id, answers=answers)
     session.add(answer_data)
     session.commit()
@@ -284,12 +358,10 @@ async def get_quiz_answers(quiz_id: int, user_id: int, session: SessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User Not found')
     questions = quiz._mapping['Quiz'].__dict__['questions']
     answers = ans._mapping['Answers'].__dict__['answers']
-    return [questions, answers]
+    return {user_id: {'Questions': questions, 'Answers': answers}}
     
 
-@app.get('/quiz/ids')
-def get_ids(current_user: User = Depends(get_current_active_user)):
-    pass
+
     
 
 if __name__ == "__main__":
