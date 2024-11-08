@@ -144,8 +144,17 @@ async def read_own_items(current_user: User = Depends(get_current_active_user)):
     return [{'item_id': 1, "owner": current_user}]
 
 
-
-
+@app.get('/users/attempted')
+async def get_attempted(session: SessionDep, current_user: User = Depends(get_current_active_user)):
+    att = session.exec(select(Attempted).where(Attempted.user_id == current_user.id))
+    ls = [a._mapping['Attempted'].__dict__['quiz_id'] for a in att]
+    return ls
+    
+@app.get('/users/created')
+async def get_attempted(session: SessionDep, current_user: User = Depends(get_current_active_user)):
+    att = session.exec(select(Created).where(Created.user_id == current_user.id))
+    ls = [a._mapping['Created'].__dict__['quiz_id'] for a in att]
+    return ls
 
 
 @app.post("/login")
@@ -353,7 +362,7 @@ async def get_quiz_answers(quiz_id: int, user_id: int, session: SessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Quiz Not found')
     
     
-    ans = session.exec(select(Answers).where(Answers.user_id == user_id and Answers.quiz_id == quiz_id)).one_or_none()
+    ans = session.exec(select(Answers).where(and_(Answers.user_id == user_id, Answers.quiz_id == quiz_id))).one_or_none()
     if not ans:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='User Not found')
     questions = quiz._mapping['Quiz'].__dict__['questions']
